@@ -289,7 +289,9 @@ class Pico
 
         // evaluate request url
         $this->evaluateRequestUrl();
-        $this->triggerEvent('onRequestUrl', array(&$this->requestUrl));
+        
+        // Jalvi: pass the config. This allows us to do per directory (site) custom themes
+        $this->triggerEvent('onRequestUrl', array(&$this->requestUrl, &$this->config));
 
         // discover requested file
         $this->discoverRequestFile();
@@ -316,6 +318,9 @@ class Pico
 
         $this->triggerEvent('onMetaParsing', array(&$this->rawContent, &$headers));
         $this->meta = $this->parseFileMeta($this->rawContent, $headers);
+
+        //file_put_contents('/tmp/out4.txt', print_r($this->meta, true));
+        
         $this->triggerEvent('onMetaParsed', array(&$this->meta));
 
         // register parsedown
@@ -326,7 +331,8 @@ class Pico
         $this->triggerEvent('onContentParsing', array(&$this->rawContent));
 
         $this->content = $this->prepareFileContent($this->rawContent, $this->meta);
-        $this->triggerEvent('onContentPrepared', array(&$this->content));
+        
+        $this->triggerEvent('onContentPrepared', array(&$this->content), array(&$this->doMarkdownParse));
 
         $this->content = $this->parseFileContent($this->content);
         $this->triggerEvent('onContentParsed', array(&$this->content));
@@ -334,8 +340,12 @@ class Pico
         // read pages
         $this->triggerEvent('onPagesLoading');
 
-        $this->readPages();
-        $this->sortPages();
+        // JAlvi: We already know the requested page (from: discoverRequestFile()) so use a modified
+        // readPages2() that only reads in the requested page. In the original code, readPages() 
+        // reads *all* the site content on every page request to build links. I don't need this. Also, since there's
+        // always only one page in the page list, we don't have to sort it.
+        $this->readPages2();
+        //$this->sortPages();
         $this->discoverCurrentPage();
 
         $this->triggerEvent('onPagesLoaded', array(
@@ -912,7 +922,14 @@ class Pico
             throw new LogicException("Unable to parse file contents: Parsedown instance wasn't registered yet");
         }
 
-        return $this->parsedown->text($content);
+        // If there is metadata on the .md document with UserMarkdown = no, then the contet
+        // is not run through markdown filters. Important for content that is HTML.
+        if(array_key_exists('usemarkdown', $this->meta) && $this->meta['usemarkdown'] == 'no') {
+            return $content;
+        }
+        else {
+            return $this->parsedown->text($content);
+        }
     }
 
     /**
@@ -953,6 +970,77 @@ class Pico
     {
         $this->pages = array();
         $files = $this->getFiles($this->getConfig('content_dir'), $this->getConfig('content_ext'), Pico::SORT_NONE);
+        foreach ($files as $i => $file) {
+            // skip 404 page
+            if (basename($file) === '404' . $this->getConfig('content_ext')) {
+                unset($files[$i]);
+                continue;
+            }
+
+            $id = substr($file, strlen($this->getConfig('content_dir')), -strlen($this->getConfig('content_ext')));
+
+            // drop inaccessible pages (e.g. drop "sub.md" if "sub/index.md" exists)
+            $conflictFile = $this->getConfig('content_dir') . $id . '/index' . $this->getConfig('content_ext');
+            if (in_array($conflictFile, $files, true)) {
+                continue;
+            }
+
+            $url = $this->getPageUrl($id);
+            if ($file != $this->requestFile) {
+                $rawContent = file_get_contents($file);
+
+                $headers = $this->getMetaHeaders();
+                try {
+                    $meta = $this->parseFileMeta($rawContent, $headers);
+                } catch (\Symfony\Component\Yaml\Exception\ParseException $e) {
+                    $meta = $this->parseFileMeta('', $headers);
+                    $meta['YAML_ParseError'] = $e->getMessage();
+                }
+            } else {
+                $rawContent = &$this->rawContent;
+                $meta = &$this->meta;
+            }
+
+            // build page data
+            // title, description, author and date are assumed to be pretty basic data
+            // everything else is accessible through $page['meta']
+            $page = array(
+                'id' => $id,
+                'url' => $url,
+                'title' => &$meta['title'],
+                'description' => &$meta['description'],
+                'author' => &$meta['author'],
+                'time' => &$meta['time'],
+                'date' => &$meta['date'],
+                'date_formatted' => &$meta['date_formatted'],
+                'raw_content' => &$rawContent,
+                'meta' => &$meta
+            );
+
+            if ($file === $this->requestFile) {
+                $page['content'] = &$this->content;
+            }
+
+            unset($rawContent, $meta);
+
+            // trigger event
+            $this->triggerEvent('onSinglePageLoaded', array(&$page));
+
+            $this->pages[$id] = $page;
+        }
+    }
+
+    /*
+     * Modified version of readPage() that only reads the requested page instead of all of them
+     */
+    protected function readPages2()
+    {
+        $this->pages = array();
+        
+        // JAlvi: Fixed to only read the file actually requested
+        $files[] = $this->getRequestFile();
+        //$files = $this->getFiles($this->getConfig('content_dir'), $this->getConfig('content_ext'), Pico::SORT_NONE);
+        
         foreach ($files as $i => $file) {
             // skip 404 page
             if (basename($file) === '404' . $this->getConfig('content_ext')) {
